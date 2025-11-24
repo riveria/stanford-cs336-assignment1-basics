@@ -1,87 +1,104 @@
 from __future__ import annotations
 
-import os
+import json
+from typing import Iterable, Iterator
 import regex as re
 
-def train_bpe(
-    input_path: str | os.PathLike,
-    vocab_size: int,
-    special_tokens: list[str],
-    **kwargs,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Given the path to an input corpus, run train a BPE tokenizer and
-    output its vocabulary and merges.
-
-    Args:
-        input_path (str | os.PathLike): Path to BPE tokenizer training data.
-        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
-
-    Returns:
-        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges:
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
-    """
+import cs336_basics.bpe_trainer
 
 
-    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-    merges: list[tuple[int, int]] = []
-    for i in range(len(special_tokens)):
-        vocab[len(vocab)] = special_tokens[i].encode('utf-8')
+class Tokenizer:
+    def __init__(self, vocab, merges, special_tokens=None):
+        """
+        Construct a tokenizer from a given vocabulary, list of merges, and (optionally) a list of special tokens. This
+        function should accept the following parameters:
+            vocab: dict[int, bytes]
+            merges: list[tuple[bytes, bytes]]
+            special_tokens: list[str] | None = None
+        """
+        self.vocab = vocab
+        self.vocab_index = {v:k for k, v in self.vocab.items()}
+        for t in special_tokens or []:
+            if t.encode('utf-8') not in self.vocab_index:
+                self.vocab_index[t] = len(self.vocab)
+                self.vocab[self.vocab_index[t]] = t
+        self.merges = merges
+        self.merges_rank = {self.merges[i]:i for i in range(len(self.merges))}
+        self.special_tokens = special_tokens
 
-    # chunk by special_tokens
-    special_tokens_escaped = [re.escape(t) for t in special_tokens]
-    split = '|'.join(special_tokens_escaped)
-    with open(input_path, encoding='utf-8') as f:
-        lines = re.split(split, f.read())
+    @staticmethod
+    def from_files(vocab_filepath, merges_filepath, special_tokens=None):
+        """
+        Class method that constructs and return a Tokenizer from a serialized vocabulary and list of merges (in the same
+        format that your BPE training code output) and (optionally) a list of special tokens. This method should accept the
+        following additional parameters:
+            vocab_filepath: str
+            merges_filepath: str
+            special_tokens: list[str] | None = None
+        """
+        with open(vocab_filepath) as f:
+            vocab = json.load(f)
+        vocab = { v:k for k, v in vocab.items() }
+        merges = []
+        with open(merges_filepath) as f:
+            for line in f:
+                tokens = line.rstrip().split(" ")
+                if len(tokens) == 2:
+                    merges.append(tuple(tokens))
 
-    # regex-based pre-tokenizer used by GPT-2
-    from collections import defaultdict
-    pre_tokenizer_pat = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    pre_tokens_and_counts: dict[bytes, tuple[int, list[int]]] = {}
-    for line in lines:
-        for t in re.finditer(pre_tokenizer_pat, line):
-            token = t.group().encode('utf-8')
-            if token not in pre_tokens_and_counts:
-                pre_tokens_and_counts[token] = (1, list(token))
-            else:
-                c, l = pre_tokens_and_counts[token]
-                pre_tokens_and_counts[token] = (c + 1, l)
-    #print(pre_tokens_and_counts)
+        yield from Tokenizer(vocab, merges, special_tokens)
 
-    while len(vocab) < vocab_size:
-        # find the most popular bi-gram
-        counts: dict[tuple[int, int], int] = defaultdict(int)
-        for pre_token, (c, token_list) in pre_tokens_and_counts.items():
-            for i in range(1, len(token_list)):
-                counts[(token_list[i-1], token_list[i])] += c
-        new_v = max(counts, key=lambda k: (counts[k], vocab[k[0]], vocab[k[1]]))
-        #new_v = max(counts, key=counts.get)
-        new_v_inx = len(vocab)
-        vocab[new_v_inx] = vocab[new_v[0]] + vocab[new_v[1]]
-        #print(new_v_inx, new_v, vocab[new_v[0]].encode("utf-8"), vocab[new_v[1]].encode("utf-8"), counts[new_v])
-        merges.append(new_v)
-        # merge with the new vocab
-        for pre_token, (c, token_list) in pre_tokens_and_counts.items():
-            i = 0
-            new_token_list: list[int] = []
-            while i < len(token_list):
-                if token_list[i] == new_v[0] and i + 1 < len(token_list) and token_list[i + 1] == new_v[1]:
-                    new_token_list.append(new_v_inx)
-                    i += 2
-                else:
-                    new_token_list.append(token_list[i])
-                    i += 1
-            pre_tokens_and_counts[pre_token] = (c, new_token_list)
-        #if len(vocab) >= vocab_size:
-            #print(counts)
+    def encode(self, text: str) -> list[int]:
+        """Encode an input text into a sequence of token IDs."""
+        texts = [text]
+        tokens_endoftext = []
+        #print(len(self.vocab) - 1, self.vocab[len(self.vocab) - 1])
+        if self.special_tokens:
+            special_tokens_escaped = sorted([re.escape(t) for t in self.special_tokens], key=len, reverse=True)
+            split = '|'.join(special_tokens_escaped)
+            texts = re.split(split, text)
+            for t in re.finditer(split, text):
+                tokens_endoftext.append(self.vocab_index[t.group().encode('utf-8')])
+        #print(texts, tokens_endoftext)
+        #print(self.vocab_index)
 
-    return vocab, [(vocab[a], vocab[b]) for a, b in merges]
+        tokens = []
+        #print(texts)
+        for text in texts:
+            if text:
+                for t in re.finditer(cs336_basics.bpe_trainer.pre_tokenizer_pattern, text):
+                    words = [bytes([c]) for c in t.group().encode('utf-8')]
+
+                    while True:
+                        low_rank, to_merge = -1, None
+                        for i in range(1, len(words)):
+                            if (words[i-1], words[i]) in self.merges_rank:
+                                if low_rank < 0 or self.merges_rank[words[i-1], words[i]] < low_rank:
+                                    low_rank = self.merges_rank[words[i-1], words[i]]
+                                    to_merge = i
+                        if low_rank < 0:
+                            break
+                        #print(words, low_rank, words[to_merge-1], words[to_merge])
+                        words = words[:to_merge-1] + [b''.join([words[to_merge-1], words[to_merge]])] + words[to_merge+1:]
+                        #print(words)
+                    #print(words)
+                    tokens += [self.vocab_index[w] for w in words]
+            if tokens_endoftext:
+                tokens.append(tokens_endoftext[0])
+                tokens_endoftext.pop(0)
+        #print(tokens)
+        return tokens
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        Given an iterable of strings (e.g., a Python file handle), return a generator that lazily yields token IDs. This
+        is required for memory-efficient tokenization of large files that we cannot directly load into memory.
+        """
+        for text in iterable:
+            yield from self.encode(text)
+
+    def decode(self, ids: list[int]) -> str:
+        """Decode a sequence of token IDs into text"""
+        all_bytes = b''.join(self.vocab[id] for id in ids)
+        #print(all_bytes)
+        return all_bytes.decode('utf-8', errors='replace')
